@@ -87,7 +87,8 @@ def parse_args():
     p.add_argument("--ckpt", help="FlowHMR checkpoint (default: models/flowhmr_latest/flowhmr_latest.ckpt)")
     p.add_argument("--model_cfg", default=None,
                    help="model config yaml (default: config.yml next to the ckpt)")
-    p.add_argument("--device", default="cuda")
+    p.add_argument("--device", default="auto",
+                   help="auto (default), cuda, cuda:N, rocm, mps, apple or cpu")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--cfg_scale", type=float, default=1.0)
     p.add_argument("--steps", type=int, default=None,
@@ -115,6 +116,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    from flowhmr.device_support import detect_device
+
+    backend = detect_device(args.device)
+    args.device = backend.device
+    print(f"backend: {backend.label} ({backend.device}, {backend.runtime or 'host'})")
     videos = collect_videos(args.videos)
     ckpt, model_cfg = check_files(args.ckpt, args.model_cfg)
     tag = os.path.splitext(os.path.basename(ckpt))[0]
