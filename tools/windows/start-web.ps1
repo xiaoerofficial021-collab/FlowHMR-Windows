@@ -39,6 +39,7 @@ if (Test-Path -LiteralPath $stateFile) {
         $state = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
         $recordedId = [int]$state.pid
         $recordedPort = [int]$state.port
+        $recordedKey = [string]$state.key
     } catch {
         Write-Warning 'The saved FlowHMR process record is invalid.'
         $state = $null
@@ -81,10 +82,16 @@ if ($DesktopJobName -and $serverProcess) {
             $null -eq $oldJobs.total -or $null -eq $oldJobs.deletable_count) {
             throw 'Could not verify the state of the previous FlowHMR service.'
         }
-        if ($oldJobs.total -ne $oldJobs.deletable_count -or
-            $oldInfo.model_files.download.status -in @('running', 'stopping') -or
-            $oldInfo.model_files.import.state -eq 'running' -or
-            $oldRuntime.download.status -in @('running', 'stopping')) {
+        # A surviving service was started with an older FLOWHMR_DESKTOP_CHARACTER_KEY, so
+        # the native character picker in this window would get 403 from /api/desktop/*.
+        # Restarting is the only way to resync the key; only do it when nothing is running.
+        $keyChanged = $recordedKey -and ($recordedKey -ne $env:FLOWHMR_DESKTOP_CHARACTER_KEY)
+        $busy = $oldInfo.model_files.download.status -in @('running', 'stopping') -or
+                $oldInfo.model_files.import.state -eq 'running' -or
+                $oldRuntime.download.status -in @('running', 'stopping')
+        if ($keyChanged -and -not $busy) {
+            Write-Host 'Desktop key changed; restarting the service so the character picker stays usable.'
+        } elseif ($oldJobs.total -ne $oldJobs.deletable_count -or $busy) {
             throw 'The previous FlowHMR service still has work in progress.'
         }
         & (Join-Path $PSScriptRoot 'stop-web.ps1') -ExpectedPid $recordedId
@@ -102,7 +109,7 @@ if ($null -eq $serverProcess) {
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
     try { $listener.Start() } catch { throw "Port $Port is occupied. Choose another port with -Port or stop the existing server." } finally { $listener.Stop() }
     $serverProcess = Start-Process -FilePath $pythonExe -ArgumentList @('-u','app.py','--host','127.0.0.1','--port',"$Port",'--device','cuda','--sam-chunk-default','24') -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logDir 'web.stdout.log') -RedirectStandardError (Join-Path $logDir 'web.stderr.log') -PassThru
-    @{pid=$serverProcess.Id;port=$Port;root=$projectRoot} | ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
+    @{pid=$serverProcess.Id;port=$Port;root=$projectRoot;key=$env:FLOWHMR_DESKTOP_CHARACTER_KEY} | ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
     Write-Host "Starting FlowHMR. Logs: $logDir"
 }
 $deadline = (Get-Date).AddMinutes(5)
