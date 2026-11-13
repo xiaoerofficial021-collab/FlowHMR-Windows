@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 from urllib.parse import urlsplit
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
@@ -187,7 +188,17 @@ def expose_model_pickers(window, port, backend, choose):
         try:
             with urlopen(req, timeout=10) as result:
                 return json.load(result)
+        except HTTPError as error:
+            # A 403 means the desktop key and the running backend are out of sync: a new
+            # window attached to a backend that an older window started, so the key baked
+            # into the backend's environment no longer matches backend.character_key.
+            detail = error.read().decode("utf-8", "replace")[:200]
+            logging.error("character-file registration failed: HTTP %s %s", error.code, detail)
+            if error.code == 403:
+                logging.warning("Desktop key rejected; restart FlowHMR so the backend picks up the current key.")
+            return {"error": "character_file", "status": error.code, "detail": detail}
         except (OSError, ValueError):
+            logging.exception("character-file registration failed")
             return {"error": "character_file"}
 
     window.expose(choose_model_folder, choose_model_archive, choose_character_file)
