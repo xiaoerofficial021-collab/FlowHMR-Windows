@@ -254,6 +254,7 @@ RUNTIME_SWITCH_LOCK = threading.Lock()
 ENGINE = None
 INSPECTION = None
 ARGS = None
+DEVICE_BACKEND = None
 JOBS = {}
 MEMBER_DIRS = {}
 JOBS_LOCK = threading.Lock()
@@ -1652,6 +1653,7 @@ def api_info():
         inventory["import"] = MODEL_IMPORTER.status()
     return jsonify({
         "model": flowhmr_paths(ARGS.ckpt, config)[0].name, "device": ARGS.device,
+        "device_backend": DEVICE_BACKEND.summary() if DEVICE_BACKEND else None,
         "models_loaded": ENGINE is not None,
         "model_files": inventory,
         "runtime": RUNTIME.summary(),
@@ -2627,7 +2629,8 @@ def parse_args():
     p.add_argument("--model_cfg", default=None)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8080)
-    p.add_argument("--device", default=RUNTIME.default_device())
+    p.add_argument("--device", default="auto",
+                   help="auto (default), cuda, cuda:N, rocm, xpu, mps, apple or cpu")
     p.add_argument("--sam-chunk-default", type=int, default=16, help="Initial value in the manual batch field")
     p.add_argument("--work_dir", default=os.path.join(REPO_ROOT, "output", "web_jobs"))
     args = p.parse_args()
@@ -2637,8 +2640,14 @@ def parse_args():
 
 
 def main():
-    global ARGS, INSPECTION
+    global ARGS, INSPECTION, DEVICE_BACKEND
     ARGS = parse_args()
+    from flowhmr.device_support import detect_device
+
+    DEVICE_BACKEND = detect_device(ARGS.device)
+    ARGS.device = DEVICE_BACKEND.device
+    print(f"  backend: {DEVICE_BACKEND.label} ({DEVICE_BACKEND.device}, "
+          f"{DEVICE_BACKEND.runtime or 'host'})")
     if ARGS.ckpt:
         ARGS.ckpt = os.path.abspath(ARGS.ckpt)
     if ARGS.model_cfg:
