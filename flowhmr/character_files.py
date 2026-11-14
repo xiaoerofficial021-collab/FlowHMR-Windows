@@ -9,7 +9,7 @@ from time import monotonic
 
 
 KEY_ENV = "FLOWHMR_DESKTOP_CHARACTER_KEY"
-MODEL_EXTENSIONS = {".pmx", ".fbx", ".vrm"}
+MODEL_EXTENSIONS = {".pmx", ".fbx"}
 TEXTURE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".webp", ".sph", ".spa", ".dds"}
 MAX_MODEL_BYTES = 256 << 20
 MAX_TEXTURE_BYTES = 64 << 20
@@ -48,19 +48,28 @@ class CharacterFiles:
             raise ValueError("Invalid character file path")
         path = Path(value)
         if not path.is_absolute() or path.suffix.lower() not in MODEL_EXTENSIONS:
-            raise ValueError("Select a PMX, FBX or VRM")
+            raise ValueError("Select a PMX or FBX")
         path = path.resolve(strict=True)
         if path.suffix.lower() not in MODEL_EXTENSIONS or not path.is_file():
             raise ValueError("Not a character file")
         size = path.stat().st_size
         if not 0 < size <= MAX_MODEL_BYTES:
             raise ValueError("Character file size out of range")
-        ticket = token_urlsafe(32)
         now = monotonic()
+        wanted = normcase(str(path))
         with self._lock:
             self._tickets = {key: entry for key, entry in self._tickets.items() if entry.expires > now}
+            # Reuse the ticket for a path that is already registered. The resource
+            # URL then stays stable across character switches, which is what lets
+            # the browser serve the model and its textures from cache instead of
+            # re-downloading them every time.
+            for ticket, entry in self._tickets.items():
+                if normcase(str(entry.model)) == wanted:
+                    entry.expires = now + LIFETIME_SECONDS
+                    return {"ticket": ticket, "name": path.name}
             if len(self._tickets) >= MAX_TICKETS:
                 del self._tickets[next(iter(self._tickets))]
+            ticket = token_urlsafe(32)
             self._tickets[ticket] = Selection(now + LIFETIME_SECONDS, path)
         return {"ticket": ticket, "name": path.name}
 
@@ -75,9 +84,17 @@ class CharacterFiles:
             return entry.model, tuple(entry.textures.values())
 
     def revoke_directory(self, directory):
+        # Tickets store the resolved model path, so a caller handing over a
+        # junction or symlinked directory must be matched on its resolved form
+        # too, or the entries would linger until they expire.
+        candidates = [Path(directory)]
+        try:
+            candidates.append(Path(directory).resolve())
+        except (OSError, RuntimeError):
+            pass
         with self._lock:
             self._tickets = {key: entry for key, entry in self._tickets.items()
-                             if not entry.model.is_relative_to(directory)}
+                             if not any(entry.model.is_relative_to(candidate) for candidate in candidates)}
 
     def resource(self, ticket, texture=None):
         with self._lock:
@@ -90,8 +107,6 @@ class CharacterFiles:
                 # Do not follow a replacement link after the file was approved.
                 return model if model.resolve(strict=True) == model and model.is_file() \
                     and 0 < model.stat().st_size <= MAX_MODEL_BYTES else None
-            if model.suffix.lower() == ".vrm":
-                return None
             parts = texture_parts(texture)
             if not parts:
                 return None

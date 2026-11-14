@@ -1502,10 +1502,12 @@ def api_mcp_character(job_id):
         return api_error('character_settings_failed', str(error), 400)
 
 
-def check_character_library_request():
+def check_character_library_request(max_bytes=16384):
+    """Bound the JSON body, but let callers opt out (thumbnail uploads pass
+    None and enforce their own, larger limit)."""
     if not local_model_request() or request.headers.get("Sec-Fetch-Site") == "cross-site":
         abort(403)
-    if request.content_length and request.content_length > 16384:
+    if max_bytes is not None and request.content_length and request.content_length > max_bytes:
         abort(413)
 
 
@@ -1534,6 +1536,22 @@ def api_character_library():
         if request.method == "POST":
             return api_error("character_library_save", "无法将模型和贴图存入角色库。", 400)
         return api_error("character_library_read", "无法读取本地角色库。", 500)
+
+
+@app.post("/api/character-library/<identifier>/thumbnail")
+def api_set_character_thumbnail(identifier):
+    # Token uploads are far larger than a JSON call, so the generic body bound is
+    # lifted here and a 1 MiB ceiling applied instead.
+    check_character_library_request(max_bytes=None)
+    if (request.content_length or 0) > 1024 * 1024:
+        abort(413)
+    try:
+        CHARACTER_LIBRARY.write_thumbnail(identifier, request.get_data(cache=False))
+    except FileNotFoundError:
+        return api_error("character_library_missing", "此角色的文件无法读取，请重新导入。", 404)
+    except (OSError, ValueError):
+        return api_error("character_library_thumbnail", "无法保存角色缩略图。", 400)
+    return jsonify(ok=True)
 
 
 @app.post("/api/character-library/<identifier>/open")

@@ -5,6 +5,7 @@ from math import isfinite
 from pathlib import Path
 import re
 from shutil import rmtree
+import struct
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from threading import Lock
 from time import sleep
@@ -15,6 +16,21 @@ from .character_files import MAX_MODEL_BYTES, MAX_TEXTURE_BYTES, MODEL_EXTENSION
 _ID = re.compile(r"[0-9a-f]{64}")
 _RETIRED = re.compile(r"\.removed-[0-9a-f]{32}")
 _MAX_BUNDLE_BYTES = 1 << 30
+THUMBNAIL_NAME = "thumbnail.png"
+MAX_THUMBNAIL_BYTES = 512 << 10
+MAX_THUMBNAIL_SIDE = 512
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def thumbnail_is_valid(data):
+    """Accept only a small, real PNG: the file is served back to the web UI."""
+    if not isinstance(data, (bytes, bytearray)) or not 33 <= len(data) <= MAX_THUMBNAIL_BYTES:
+        return False
+    if bytes(data[:8]) != _PNG_SIGNATURE or bytes(data[12:16]) != b"IHDR":
+        return False
+    width, height = struct.unpack(">II", bytes(data[16:24]))
+    return 0 < width <= MAX_THUMBNAIL_SIDE and 0 < height <= MAX_THUMBNAIL_SIDE
+
 
 
 def _read_json(path):
@@ -44,10 +60,9 @@ def _pose(value):
             "ikMode": "ik" if value.get("ikMode") == "ik" else "fk",
             "rootRotation": triple(value.get("rootRotation"), 180),
             "rootTranslation": triple(value.get("rootTranslation"), 5)}
-    for key in ("pmxBaselineVersion", "vrmBaselineVersion"):
-        baseline = value.get(key)
-        if type(baseline) is int and baseline == 1:
-            pose[key] = baseline
+    baseline = value.get("pmxBaselineVersion")
+    if type(baseline) is int and baseline == 1:
+        pose["pmxBaselineVersion"] = baseline
     return pose
 
 
@@ -77,8 +92,14 @@ class CharacterLibrary:
         if not file.is_file() or file.resolve() != canonical / "files" / filename:
             return None
         name = record.get("name")
+        thumbnail = directory / THUMBNAIL_NAME
+        try:
+            size = file.stat().st_size
+        except OSError:
+            return None
         return {"id": identifier, "filename": filename, "name": name if isinstance(name, str) and name else filename,
-                "kind": file.suffix[1:].lower()}, file
+                "kind": file.suffix[1:].lower(), "bytes": size,
+                "hasThumb": thumbnail.is_file() and thumbnail.resolve() == canonical / THUMBNAIL_NAME}, file
 
     def open(self, identifier, selections):
         with self._lock:
@@ -87,12 +108,14 @@ class CharacterLibrary:
                 raise FileNotFoundError("Character is not in the library")
             return selections.register(str(entry[1].resolve()))
 
-    def save(self, selections, ticket, name):
+    def save(self, selections, ticket, name, thumbnail=None):
         model, textures = selections.bundle(ticket)
         if texture_parts(model.name) != (model.name,):
             raise ValueError("Invalid character filename")
         label = " ".join(name.split())[:200] if isinstance(name, str) else ""
         record = {"filename": model.name, "name": label or model.stem}
+        if thumbnail is not None and not thumbnail_is_valid(thumbnail):
+            raise ValueError("Invalid character thumbnail")
         self.root.mkdir(parents=True, exist_ok=True)
         digest = sha256()
         total = 0
@@ -123,6 +146,8 @@ class CharacterLibrary:
                     raise ValueError("Character file changed while importing")
                 digest.update(relative.encode("utf-8") + b"\0" + file_digest.digest())
             identifier = digest.hexdigest()
+            if thumbnail is not None:
+                (entry / THUMBNAIL_NAME).write_bytes(bytes(thumbnail))
             (entry / "character.json").write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
             with self._lock:
                 existing = self._entry(identifier)
@@ -200,6 +225,33 @@ class CharacterLibrary:
         return {"models": models, "defaults": state.get("defaults", {}), "presets": state.get("presets", {}),
                 "actors": {identifier: actors[identifier] for identifier in actor_ids if identifier in actors}}
 
+    def write_thumbnail(self, identifier, data):
+        """Store a rendered thumbnail for an entry that does not have one yet."""
+        if not thumbnail_is_valid(data):
+            raise ValueError("Invalid character thumbnail")
+        with self._lock:
+            if self._entry(identifier) is None:
+                raise FileNotFoundError("Character is not in the library")
+            directory = self.root / identifier
+            target = directory / THUMBNAIL_NAME
+            stream = directory / f".thumb-{uuid4().hex}.tmp"
+            try:
+                stream.write_bytes(bytes(data))
+                stream.replace(target)
+            finally:
+                stream.unlink(missing_ok=True)
+        return True
+
+    def thumbnail_path(self, identifier):
+        with self._lock:
+            if self._entry(identifier) is None:
+                return None
+        path = self.root / identifier / THUMBNAIL_NAME
+        try:
+            return path if path.is_file() and 0 < path.stat().st_size <= MAX_THUMBNAIL_BYTES else None
+        except OSError:
+            return None
+
     def set_actor(self, actor, slot, identifier, offsets, *, select):
         with self._lock:
             if identifier is not None and self._entry(identifier) is None:
@@ -219,28 +271,6 @@ class CharacterLibrary:
             if select or defaults.get(slot, {}).get("actor") == actor:
                 defaults[slot] = {"actor": actor, "id": identifier, "offsets": offsets}
             self._write(state)
-
-    def update_pose(self, actor, slot, identifier, transform):
-        """Atomically patch the selected character without overwriting another selection."""
-        with self._lock:
-            state = _read_json(self._preferences)
-            record = state.get('actors', {}).get(actor)
-            if record is None:
-                default = state.get('defaults', {}).get(slot, {})
-                if default.get('id') == identifier and identifier is not None:
-                    record = {'id': identifier, 'poses': {identifier: default.get('offsets', {})}}
-                    state.setdefault('actors', {})[actor] = record
-            if record is None or record.get('id') != identifier:
-                raise ValueError('Selected character changed; query the actor before editing again')
-            if self._entry(identifier) is None:
-                raise FileNotFoundError('Character is not in the library')
-            offsets = _pose(transform(record.get('poses', {}).get(identifier, {})))
-            record.setdefault('poses', {})[identifier] = offsets
-            state.setdefault('presets', {})[identifier] = offsets
-            if state.get('defaults', {}).get(slot, {}).get('actor') == actor:
-                state['defaults'][slot] = {'actor': actor, 'id': identifier, 'offsets': offsets}
-            self._write(state)
-            return offsets
 
     def forget_actors(self, ids):
         if not ids:
